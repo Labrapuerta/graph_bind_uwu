@@ -4,12 +4,26 @@ from Bio.PDB import PDBParser, DSSP, Selection
 from Bio.Data.PDBData import protein_letters_3to1 as three_to_one
 import torch
 from torch_geometric.data import Data
-import esm
+#import esm
 import hashlib
 from pathlib import Path
 from dataclasses import dataclass
 from torch.utils.data import Dataset
+from src.constants.kyte_doolittle import Hydrophobicity
+from src.constants.formal_charge import formal_charge
+from src.constants.isoelectric import Isoelectric
+from src.constants.side_chain import Sidechain_length
 
+
+
+
+HYDROPHOBICITY = Hydrophobicity
+FORMAL_CHARGE = formal_charge
+ISOELECTRIC_POINT = Isoelectric
+SIDECHAIN_LENGTH = Sidechain_length
+
+STANDARD_AA = set(HYDROPHOBICITY.keys())
+DIELECTRIC_CONSTANT = 4.0   # distance-dependent dielectric (protein interior)
 
 VDW_CUTOFF = 8.0
 HBOND_ENERGY_THRESHOLD = -0.5
@@ -46,10 +60,13 @@ class ProteinGraphBuilder:
         self.res_to_idx = {r: i for i, r in enumerate(self.residues)}
 
         # Precompute once — used by vdw_edges
-        self._cb_coords = self._get_cb_coords()
+        self._cb_coords_numpy = self._get_cb_coords()
+        self._cb_coords = torch.Tensor(self._cb_coords_numpy)  # (N, 3)
 
         # Build DSSP → node index map once — used by hbond_edges
         self._dssp_to_node_idx = self._build_dssp_map()
+
+
 
         print(f"[ProteinGraphBuilder] {len(self.residues)} residues | "
               f"sequence length: {len(self.sequence)}")
@@ -151,12 +168,8 @@ class ProteinGraphBuilder:
         return edges
 
     def vdw_edges(self) -> list[tuple]:
-        """
-        Residue pairs within VDW_CUTOFF Å (Cβ–Cβ distance).
-        Weight is a Gaussian decay — closer residues get higher weight.
-        query_pairs() already excludes self-loops and duplicate pairs.
-        """
-        tree = cKDTree(self._cb_coords)
+
+        tree = cKDTree(self._cb_coords_numpy)
         edges = []
         for i, j in tree.query_pairs(r=VDW_CUTOFF):
             dist = float(np.linalg.norm(self._cb_coords[i] - self._cb_coords[j]))
@@ -165,104 +178,193 @@ class ProteinGraphBuilder:
         return edges
 
     def hbond_edges(self) -> list[tuple]:
-        """
-        Hydrogen bonds from DSSP (Kabsch-Sander energy < HBOND_ENERGY_THRESHOLD).
-        DSSP keys are mapped back to node indices via _dssp_to_node_idx to avoid
-        index misalignment between DSSP's internal ordering and self.residues.
-        Weight is the absolute Kabsch-Sander energy — stronger H-bonds get higher weight.
-        """
         dssp = DSSP(self.model, self.pdb_path, dssp="mkdssp", file_type="PDB")
         edges = []
-
-        for key in dssp.keys():
+ 
+        dssp_keys_list = list(dssp.keys())
+ 
+        for idx, key in enumerate(dssp_keys_list):
             data = dssp[key]
-
-            # Donor to acceptor and its reverse pair
             for offset_field, energy_field in [(6, 7), (8, 9)]:
                 offset = data[offset_field]
                 energy = data[energy_field]
-
+ 
                 if energy >= HBOND_ENERGY_THRESHOLD or offset == 0:
                     continue
-
-                # Resolve partner DSSP key
-                dssp_keys_list = list(dssp.keys())
-                src_dssp_idx = dssp_keys_list.index(key)
-                partner_dssp_idx = src_dssp_idx + offset
-
+ 
+                partner_dssp_idx = idx + offset
                 if not (0 <= partner_dssp_idx < len(dssp_keys_list)):
                     continue
-
+ 
                 partner_key = dssp_keys_list[partner_dssp_idx]
-
-                # Map both keys to node indices — skip if either is absent
                 src_node = self._dssp_to_node_idx.get(key)
                 dst_node = self._dssp_to_node_idx.get(partner_key)
-
+ 
                 if src_node is None or dst_node is None:
                     continue
-
+ 
                 edges.append((src_node, dst_node, float(abs(energy)), "hbond"))
-
+ 
         return edges
+    
+    def get_coulomb_term(self, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
+
+        charges = torch.tensor(
+            [float(FORMAL_CHARGE.get(r.get_resname().strip(), 0)) for r in self.residues],
+            dtype=torch.float
+        )
+    
+        q_src = charges[src]   # (E,)
+        q_dst = charges[dst]   # (E,)
+    
+        src_np = self._cb_coords_numpy[src.numpy()]
+        dst_np = self._cb_coords_numpy[dst.numpy()]
+        r = torch.tensor(np.linalg.norm(src_np - dst_np, axis=1),dtype=torch.float).clamp(min=1e-6)  # avoid division by zero
+    
+        coulomb = q_src * q_dst / (DIELECTRIC_CONSTANT * r ** 2)
+        return coulomb  # (E,)
+    
+
+    ### ----------------------------------------------------------------
+    # Node feature builders
+    # ----------------------------------------------------------------
+
+    def get_one_hot(self) -> torch.Tensor:
+
+        aa_list = sorted(STANDARD_AA)
+        aa_to_idx = {aa: i for i, aa in enumerate(aa_list)}
+    
+        one_hot = torch.zeros(len(self.residues), len(aa_list))
+        for i, res in enumerate(self.residues):
+            resname = res.get_resname().strip()
+            if resname in aa_to_idx:
+                one_hot[i, aa_to_idx[resname]] = 1.0
+        return one_hot
+    
+
+    def get_hydrophobicity(self) -> torch.Tensor:
+        """
+        Kyte-Doolittle scale. Returns (N,) float tensor.
+        Range: -4.5 (hydrophilic) to +4.5 (hydrophobic).
+        """
+
+        return torch.tensor(
+            [[HYDROPHOBICITY.get(r.get_resname().strip(), 0.0)] for r in self.residues],
+            dtype=torch.float)
+    
+    def get_formal_charge(self) -> torch.Tensor:
+        """
+        Integer formal charge at pH 7. Returns (N,) float tensor.
+        Values: -1, 0, or +1.
+        """
+        return torch.tensor(
+            [[float(FORMAL_CHARGE.get(r.get_resname().strip(), 0))] for r in self.residues],
+            dtype=torch.float
+        )
+
+        
+        
+    def get_isoelectric_point(self) -> torch.Tensor:
+        """
+        Approximate pI per residue. Returns (N,) float tensor.
+        """
+        return torch.tensor(
+            [[ISOELECTRIC_POINT.get(r.get_resname().strip(), 5.97)] for r in self.residues],
+            dtype=torch.float
+        )
+    
+    def get_sidechain_length(self, use_coords: bool = True) -> torch.Tensor:
+        """
+        Side chain length per residue.
+    
+        Args:
+            use_coords: If True, computes Euclidean distance between Cα and
+                        the farthest sidechain heavy atom from PDB coordinates.
+                        More physically accurate but requires complete sidechain.
+                        Falls back to lookup table if sidechain atoms are missing.
+                        If False, uses the bond-count lookup table directly.
+    
+        Returns: (N,) float tensor
+        """
+        lengths = []
+        for res in self.residues:
+            resname = res.get_resname().strip()
+    
+            if use_coords and "CA" in res:
+                ca = res["CA"].get_vector().get_array()
+                sidechain_atoms = [
+                    atom for atom in res.get_atoms()
+                    if atom.get_name() not in ("N", "CA", "C", "O")  # exclude backbone
+                ]
+                if sidechain_atoms:
+                    distances = [
+                        np.linalg.norm(atom.get_vector().get_array() - ca)
+                        for atom in sidechain_atoms
+                    ]
+                    lengths.append([float(max(distances))])
+                    continue
+    
+            # Fallback to bond count lookup
+            lengths.append([float(SIDECHAIN_LENGTH.get(resname, 0))])
+    
+        return torch.tensor(lengths, dtype=torch.float)
 
     # ------------------------------------------------------------------
     # Graph builder
     # ------------------------------------------------------------------
 
-    def build(self, node_features: torch.Tensor | None = None, 
-              contacts: torch.Tensor | None = None) -> Data:
-        """
-        Assembles the PyG Data object.
+    def build(self, node_features: torch.Tensor | None = None,
+            contacts: torch.Tensor | None = None, y: torch.Tensor | None = None) -> Data:
 
-        Args:
-            node_features: (N, F) tensor of precomputed node features.
-                           If None, uses zeros as placeholder.
-
-        Returns:
-            Data with:
-                x          — node features (N, F)
-                edge_index — (2, E) undirected
-                edge_attr  — (E, 2) → [weight, edge_type_int] // Implementing the contact map as an additional edge type is possible, but it requires careful handling
-
-        """
-        print(contacts)
         all_edges = self.peptide_edges() + self.vdw_edges() + self.hbond_edges()
 
         src = torch.tensor([e[0] for e in all_edges], dtype=torch.long)
         dst = torch.tensor([e[1] for e in all_edges], dtype=torch.long)
 
-        # Undirected: duplicate both directions
-        edge_index = torch.stack([
-            torch.cat([src, dst]),
-            torch.cat([dst, src])
-        ])
+        edge_index = torch.stack([torch.cat([src, dst]), torch.cat([dst, src])])
 
         weights = torch.tensor([e[2] for e in all_edges], dtype=torch.float)
-        types = torch.tensor(
-            [EDGE_TYPE_MAP[e[3]] for e in all_edges], dtype=torch.float
-        )
+        types   = torch.tensor([EDGE_TYPE_MAP[e[3]] for e in all_edges], dtype=torch.float)
 
-        # Stack weight + type — both directions get same attributes
-        edge_attr = torch.stack([weights, types], dim=1)           # (E, 2)
-        edge_attr = edge_attr.repeat(2, 1)                         # (2E, 2)
+        zero        = torch.zeros_like(weights)
+        contacts_fw = contacts[src, dst] if contacts is not None else zero
+        contacts_rv = contacts[dst, src] if contacts is not None else zero
 
+        coulomb_fw = self.get_coulomb_term(src, dst)
+        coulomb_rv = self.get_coulomb_term(dst, src)
+
+        scalar_fw = torch.stack([weights, types, contacts_fw, coulomb_fw], dim=1)  # (E, 4)
+        scalar_rv = torch.stack([weights, types, contacts_rv, coulomb_rv], dim=1)  # (E, 4)
+        edge_attr = torch.cat([scalar_fw, scalar_rv], dim=0)                       # (2E, 4)
+
+        # None check before concat — zeros must match ESM2 dim so cat stays (N, 1304)
         if node_features is None:
-            print("[ProteinGraphBuilder] No node features provided — using zeros.")
-            node_features = torch.zeros((len(self.residues), 1), dtype=torch.float)
+            print("[ProteinGraphBuilder] No node features — using zeros.")
+            node_features = torch.zeros((len(self.residues), 1280), dtype=torch.float)  # ← 1280 not 1
 
         assert node_features.shape[0] == len(self.residues), (
-            f"node_features rows {node_features.shape[0]} != "
-            f"residues {len(self.residues)}"
+            f"node_features {node_features.shape[0]} != residues {len(self.residues)}"
         )
+
+        node_features = torch.cat([
+            node_features,                               # (N, 1280)
+            self.get_one_hot(),                          # (N, 20)
+            self.get_hydrophobicity(),                   # (N, 1)
+            self.get_formal_charge(),                    # (N, 1)
+            self.get_isoelectric_point(),                # (N, 1)
+            self.get_sidechain_length(use_coords=True),  # (N, 1)
+        ], dim=1)  # (N, 1304)
 
         return Data(
             x=node_features,
+            pos=self._cb_coords,        # torch.Tensor (N, 3)
             edge_index=edge_index,
             edge_attr=edge_attr,
-            num_nodes=len(self.residues)
+            num_nodes=len(self.residues),
+            y=y
+
         )
-    
+        
 
 @dataclass
 class ESMOutput:
@@ -429,9 +531,61 @@ class ESMProcessor:
         return [results[i] for i in range(len(sequences))]
     
 
+def parse_binding_residues(binding_str: str) -> list[tuple[str, int]]:
+    """
+    Parses 'F43 R45 V68 S92' → [('F', 43), ('R', 45), ('V', 68), ('S', 92)]
+    Returns list of (one_letter_AA, resseq) tuples.
+    """
+    result = []
+    for token in binding_str.split():
+        aa      = token[0]          # one-letter AA — use for validation
+        resseq  = int(token[1:])    # PDB residue number
+        result.append((aa, resseq))
+    return result
+
+
+def get_binding_indices(
+    builder: "ProteinGraphBuilder",
+    binding_residues: list[tuple[str, int]],
+    validate_aa: bool = True,
+) -> list[int]:
+    """
+    Maps (AA, resseq) tuples → node indices in builder.residues.
+    Skips residues not found in the structure (chain breaks, filtered out, etc).
+
+    Args:
+        validate_aa: If True, warns when the AA letter doesn't match the
+                     residue at that resseq — catches PDB numbering mismatches.
+    """
+    from Bio.Data.PDBData import protein_letters_3to1 as three_to_one
+
+    # Build resseq → (node_idx, one_letter) lookup
+    resseq_map = {}
+    for i, res in enumerate(builder.residues):
+        resseq  = res.get_id()[1]                          # integer PDB resseq
+        resname = res.get_resname().strip()
+        one_letter = three_to_one.get(resname, "?")
+        resseq_map[resseq] = (i, one_letter)
+
+    binding_indices = []
+    for aa, resseq in binding_residues:
+        if resseq not in resseq_map:
+            print(f"  [warning] resseq {resseq} ({aa}) not found in structure — skipped")
+            continue
+
+        node_idx, actual_aa = resseq_map[resseq]
+
+        if validate_aa and aa != actual_aa:
+            print(f"  [warning] resseq {resseq}: expected {aa}, found {actual_aa} — included anyway")
+
+        binding_indices.append(node_idx)
+
+    return binding_indices
+    
+
 
 class ProteinDataset(Dataset):
-    def __init__(self, pdb_paths: list[str], esm_processor: ESMProcessor):
+    def __init__(self, pdb_paths: list[str], binding_residues: list[str], esm_processor: ESMProcessor):
         self.pdb_paths = pdb_paths
         self.processor = esm_processor
 
@@ -439,10 +593,19 @@ class ProteinDataset(Dataset):
         print("Parsing PDB files...")
         self.builders = [ProteinGraphBuilder(p) for p in pdb_paths]
 
+        print("Processing binding residues...")
+
+        self.binding_residues = [parse_binding_residues(br) for br in binding_residues]
+        self.binding_residue_indices = [
+            get_binding_indices(builder, br, validate_aa=True)
+            for builder, br in zip(self.builders, self.binding_residues)
+        ]
+
         # Batch all sequences through ESMFold in one pass
         print("Running ESMFold...")
         sequences = [b.sequence for b in self.builders]
         self.esm_outputs = self.processor.process_batch(sequences)
+
 
     def __len__(self):
         return len(self.builders)
@@ -450,12 +613,17 @@ class ProteinDataset(Dataset):
     def __getitem__(self, idx) -> Data:
         builder = self.builders[idx]
         esm_out = self.esm_outputs[idx]
+        bind_idx   = self.binding_residue_indices[idx]
+
+        y = torch.zeros(len(builder.residues), dtype=torch.float)
+        y[bind_idx] = 1.0
+
 
         # ESMFold also gives you a contact map — you can add it as edge weights
         # or use it to add/filter edges here before building
         node_features = esm_out.embeddings   # (L, 1024) — projection happens in GNN
         edge_attention = esm_out.contacts
-        return builder.build(node_features=node_features, contacts = edge_attention)
+        return builder.build(node_features=node_features, contacts = edge_attention, y=y)
+    
 
-
-
+ 
