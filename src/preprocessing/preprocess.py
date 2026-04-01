@@ -96,25 +96,16 @@ def download_pdb(pdb_id: str, raw_dir: Path) -> Optional[Path]:
 
     try:
         pdbl = PDBList(verbose=False)
-        # Download in PDB format (not mmCIF)
-        downloaded = pdbl.retrieve_pdb_file(
-            pdb_id,
-            pdir=str(raw_dir),
-            file_format="pdb",
-            overwrite=False,
-        )
-        if downloaded is None:
-            return None
-
-        downloaded_path = Path(downloaded)
-        if not downloaded_path.exists() or downloaded_path.stat().st_size < 100:
-            downloaded_path.unlink(missing_ok=True)
-            return None
+        # Download in PDB format (saves as pdb{id}.ent)
+        pdbl.download_pdb_files([pdb_id], pdir=str(raw_dir), file_format="pdb")
 
         # PDBList saves as pdb{id}.ent, rename to {id}.pdb
-        if downloaded_path != dest:
-            downloaded_path.rename(dest)
+        ent_path = raw_dir / f"pdb{pdb_id.lower()}.ent"
+        if not ent_path.exists() or ent_path.stat().st_size < 100:
+            ent_path.unlink(missing_ok=True)
+            return None
 
+        ent_path.rename(dest)
         return dest
     except Exception:
         dest.unlink(missing_ok=True)
