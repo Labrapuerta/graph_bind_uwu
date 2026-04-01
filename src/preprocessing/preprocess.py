@@ -121,8 +121,8 @@ def download_pdb(pdb_id: str, raw_dir: Path) -> Optional[Path]:
         return None
 
 
-def _extract_cryst1_header(pdb_path: Path) -> Optional[str]:
-    """Extract CRYST1 line from a PDB file."""
+def _extract_cryst1_header(pdb_path: Path) -> str:
+    """Extract CRYST1 line from a PDB file, or return a dummy one for DSSP compatibility."""
     try:
         with open(pdb_path, 'r') as f:
             for line in f:
@@ -130,7 +130,8 @@ def _extract_cryst1_header(pdb_path: Path) -> Optional[str]:
                     return line.rstrip('\n')
     except Exception:
         pass
-    return None
+    # Default CRYST1 line (P1 space group, 1x1x1 unit cell) - DSSP just needs this to exist
+    return "CRYST1    1.000    1.000    1.000  90.00  90.00  90.00 P 1           1"
 
 
 def download_and_extract_chain(
@@ -166,10 +167,9 @@ def download_and_extract_chain(
         io.save(temp_output, ChainSelect(chain))
         chain_content = temp_output.getvalue()
 
-        # Write output with CRYST1 header preserved
+        # Write output with CRYST1 header preserved (required by DSSP)
         with open(out_path, 'w') as f:
-            if cryst1_line:
-                f.write(cryst1_line + '\n')
+            f.write(cryst1_line + '\n')
             f.write(chain_content)
 
         full_path.unlink(missing_ok=True)
