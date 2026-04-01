@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from src.models.building_blocks import EGNNLayer, EvoformerBlock, FeatureProjection
+from .building_blocks import EGNNLayer, EvoformerBlock, FeatureProjection
 
 
 

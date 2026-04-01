@@ -43,7 +43,7 @@ import torch
 from Bio.PDB import PDBParser, PDBIO, Select
 
 # Project imports
-from src.preprocessing.GraphBuilder import (
+from .GraphBuilder import (
     ProteinGraphBuilder,
     ESMProcessor,
     parse_binding_residues,

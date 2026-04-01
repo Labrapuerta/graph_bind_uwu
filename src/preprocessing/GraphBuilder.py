@@ -9,10 +9,10 @@ import hashlib
 from pathlib import Path
 from dataclasses import dataclass
 from torch.utils.data import Dataset
-from src.constants.kyte_doolittle import Hydrophobicity
-from src.constants.formal_charge import formal_charge
-from src.constants.isoelectric import Isoelectric
-from src.constants.side_chain import Sidechain_length
+from ..constants.kyte_doolittle import Hydrophobicity
+from ..constants.formal_charge import formal_charge
+from ..constants.isoelectric import Isoelectric
+from ..constants.side_chain import Sidechain_length
 
 
 
