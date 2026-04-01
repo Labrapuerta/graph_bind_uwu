@@ -4,7 +4,7 @@ from Bio.PDB import PDBParser, DSSP, Selection
 from Bio.Data.PDBData import protein_letters_3to1 as three_to_one
 import torch
 from torch_geometric.data import Data
-#import esm
+import esm
 import hashlib
 from pathlib import Path
 from dataclasses import dataclass
