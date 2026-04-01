@@ -428,6 +428,7 @@ def preprocess(
     batch_size: int = 10,
     device: str = "cuda",
     max_workers: int = 32,
+    esm_processor: Optional[ESMProcessor] = None,
 ) -> pd.DataFrame:
     """
     Main preprocessing pipeline.
@@ -440,7 +441,8 @@ def preprocess(
         esm_cache: Cache directory for ESM2 model
         batch_size: Number of proteins to process per batch (for ESM)
         device: 'cuda' or 'cpu'
-        max_workers: Number of parallel download workersa
+        max_workers: Number of parallel download workers
+        esm_processor: Optional ESMProcessor instance. If None, creates a new one.
 
     Returns:
         DataFrame with manifest (paths to all processed files)
@@ -499,7 +501,10 @@ def preprocess(
     print(f"Step 2 — Processing in batches of {batch_size}")
     print("=" * 60)
 
-    esm_processor = ESMProcessor(cache_dir=esm_cache, device=device)
+    # Use provided processor or create new one
+    if esm_processor is None:
+        esm_processor = ESMProcessor(cache_dir=esm_cache, device=device)
+    
     processor = StreamingBatchProcessor(
         esm_processor=esm_processor,
         batch_size=batch_size,
