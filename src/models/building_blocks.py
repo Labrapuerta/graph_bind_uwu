@@ -31,6 +31,42 @@ class FeatureProjection(nn.Module):
             x = F.gelu(x)
         x = self.dropout(x)
         return x
+    
+# =============================================================================
+# Edge update projection 
+# =============================================================================
+
+class EdgeUpdateLayer(nn.Module):
+    """
+    Updates edge features using the current node features of both endpoints.
+    Runs in parallel with the node update layers.
+ 
+    h_src and h_dst are the *current* (post-update) node features,
+    so edges always reflect the latest node context.
+    """
+    def __init__(self, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+ 
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + hidden_dim, hidden_dim),  # e + h_src + h_dst
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+ 
+    def forward(
+        self,
+        edge_attr: torch.Tensor,    # (E, H) current edge features
+        h: torch.Tensor,            # (N, H) current node features
+        edge_index: torch.Tensor,   # (2, E)
+    ) -> torch.Tensor:
+        src, dst = edge_index
+        # Gather endpoint features for each edge
+        edge_input = torch.cat([edge_attr, h[src], h[dst]], dim=-1)  # (E, 3H)
+        edge_attr = edge_attr + self.dropout(self.mlp(edge_input))   # residual
+        return self.norm(edge_attr)
 
 
 # =============================================================================

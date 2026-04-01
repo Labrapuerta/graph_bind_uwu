@@ -308,6 +308,21 @@ class ProteinGraphBuilder:
             lengths.append([float(SIDECHAIN_LENGTH.get(resname, 0))])
     
         return torch.tensor(lengths, dtype=torch.float)
+    
+    def b_factor(self) -> torch.Tensor:
+        """
+        B-factor (temperature factor) per residue, averaged over all atoms.
+        Returns (N,) float tensor.
+        """
+        b_factors = []
+        for res in self.residues:
+            atoms = list(res.get_atoms())
+            if atoms:
+                avg_b = np.mean([atom.get_bfactor() for atom in atoms])
+                b_factors.append([float(avg_b)])
+            else:
+                b_factors.append([0.0])  # default if no atoms
+        return torch.tensor(b_factors, dtype=torch.float)
 
     # ------------------------------------------------------------------
     # Graph builder
@@ -353,6 +368,7 @@ class ProteinGraphBuilder:
             self.get_formal_charge(),                    # (N, 1)
             self.get_isoelectric_point(),                # (N, 1)
             self.get_sidechain_length(use_coords=True),  # (N, 1)
+            self.b_factor(),                            # (N, 1)
         ], dim=1)  # (N, 1304)
 
         return Data(
