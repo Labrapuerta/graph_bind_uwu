@@ -32,7 +32,6 @@ Usage:
 import argparse
 import gc
 import traceback
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,7 +39,7 @@ from typing import Optional
 
 import pandas as pd
 import torch
-from Bio.PDB import PDBParser, PDBIO, Select
+from Bio.PDB import PDBParser, PDBIO, Select, PDBList
 
 # Project imports
 from .GraphBuilder import (
@@ -90,20 +89,48 @@ class ChainSelect(Select):
 
 
 def download_pdb(pdb_id: str, raw_dir: Path) -> Optional[Path]:
-    """Downloads a PDB directly from RCSB. Returns saved path or None."""
+    """Downloads a PDB using BioPython's PDBList. Returns saved path or None."""
     dest = raw_dir / f"{pdb_id.lower()}.pdb"
     if dest.exists():
         return dest
-    url = f"https://files.rcsb.org/download/{pdb_id.lower()}.pdb"
+
     try:
-        urllib.request.urlretrieve(url, dest)
-        if dest.stat().st_size < 100:
-            dest.unlink(missing_ok=True)
+        pdbl = PDBList(verbose=False)
+        # Download in PDB format (not mmCIF)
+        downloaded = pdbl.retrieve_pdb_file(
+            pdb_id,
+            pdir=str(raw_dir),
+            file_format="pdb",
+            overwrite=False,
+        )
+        if downloaded is None:
             return None
+
+        downloaded_path = Path(downloaded)
+        if not downloaded_path.exists() or downloaded_path.stat().st_size < 100:
+            downloaded_path.unlink(missing_ok=True)
+            return None
+
+        # PDBList saves as pdb{id}.ent, rename to {id}.pdb
+        if downloaded_path != dest:
+            downloaded_path.rename(dest)
+
         return dest
     except Exception:
         dest.unlink(missing_ok=True)
         return None
+
+
+def _extract_cryst1_header(pdb_path: Path) -> Optional[str]:
+    """Extract CRYST1 line from a PDB file."""
+    try:
+        with open(pdb_path, 'r') as f:
+            for line in f:
+                if line.startswith("CRYST1"):
+                    return line.rstrip('\n')
+    except Exception:
+        pass
+    return None
 
 
 def download_and_extract_chain(
@@ -113,8 +140,8 @@ def download_and_extract_chain(
     out_path: Path,
 ) -> Optional[Path]:
     """
-    Downloads the full PDB from RCSB, extracts ATOM-only chain records,
-    saves to out_path, then deletes the full PDB.
+    Downloads the full PDB from RCSB using PDBList, extracts ATOM-only chain records,
+    preserves CRYST1 header (required by DSSP), saves to out_path, then deletes the full PDB.
     """
     if out_path.exists():
         return out_path
@@ -124,12 +151,27 @@ def download_and_extract_chain(
         return None
 
     try:
+        # Extract CRYST1 header before parsing (PDBIO doesn't preserve it)
+        cryst1_line = _extract_cryst1_header(full_path)
+
         parser = PDBParser(QUIET=True)
         structure = parser.get_structure(pdb_id, str(full_path))
         io = PDBIO()
         io.set_structure(structure)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        io.save(str(out_path), ChainSelect(chain))
+
+        # Save chain to a temporary string
+        from io import StringIO
+        temp_output = StringIO()
+        io.save(temp_output, ChainSelect(chain))
+        chain_content = temp_output.getvalue()
+
+        # Write output with CRYST1 header preserved
+        with open(out_path, 'w') as f:
+            if cryst1_line:
+                f.write(cryst1_line + '\n')
+            f.write(chain_content)
+
         full_path.unlink(missing_ok=True)
         return out_path
     except Exception:
