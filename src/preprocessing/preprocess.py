@@ -440,7 +440,7 @@ def preprocess(
         esm_cache: Cache directory for ESM2 model
         batch_size: Number of proteins to process per batch (for ESM)
         device: 'cuda' or 'cpu'
-        max_workers: Number of parallel download workers
+        max_workers: Number of parallel download workersa
 
     Returns:
         DataFrame with manifest (paths to all processed files)
