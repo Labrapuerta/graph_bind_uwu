@@ -350,6 +350,43 @@ class StreamingBatchProcessor:
 
         try:
             esm_outputs = self.esm.process_batch(sequences)
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            if "out of memory" not in str(e).lower() and isinstance(e, RuntimeError):
+                raise
+            print(f"  [ESM OOM] Batch failed, retrying one-by-one...")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            esm_outputs = []
+            failed_indices = []
+            for k, entry in enumerate(valid_entries):
+                try:
+                    out = self.esm.process(entry["sequence"])
+                    esm_outputs.append(out)
+                except (torch.cuda.OutOfMemoryError, RuntimeError) as e2:
+                    if "out of memory" not in str(e2).lower() and isinstance(e2, RuntimeError):
+                        raise
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    esm_outputs.append(None)
+                    failed_indices.append(k)
+
+            # Record individual failures 
+            for k in sorted(failed_indices, reverse=True):
+                entry = valid_entries[k]
+                results.append(ProcessingResult(
+                    pdb_id=entry["row"]["PDB_ID"],
+                    chain=entry["row"]["Chains_To_Keep"],
+                    split=entry["row"]["Split"],
+                    cv_batch=int(entry["row"]["CV_Batch"]) if pd.notna(entry["row"]["CV_Batch"]) else 0,
+                    status="fail",
+                    error=f"ESM OOM: sequence too long ({len(entry['sequence'])} residues)",
+                ))
+                valid_entries.pop(k)
+                esm_outputs.pop(k)
+
+            if not valid_entries:
+                return results
         except Exception as e:
             print(f"  [ESM error] {e}")
             for entry in valid_entries:
