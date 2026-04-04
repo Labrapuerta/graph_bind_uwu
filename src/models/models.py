@@ -1,125 +1,165 @@
 import torch
 import torch.nn as nn
+from .building_blocks import EGNNLayer, EvoformerBlock, FeatureProjection, EdgeUpdateLayer
 
-from .building_blocks import EGNNLayer, EvoformerBlock, FeatureProjection
-
-
-
-# =============================================================================
-# FULL MODEL: Combining Everything
-# =============================================================================
 
 class ProteinBindingGNN(nn.Module):
-    """
-    Full model for protein binding site prediction.
-
-    Architecture:
-    1. Feature projection (ESM2 + biochemical features -> hidden dim)
-    2. EGNN layers (equivariant message passing, updates coords)
-    3. Evoformer blocks (attention + FFN, captures long-range dependencies)
-    4. Output head (per-residue binding probability)
-
-    Why this combination?
-    - EGNN: handles 3D structure, maintains rotation equivariance
-    - Evoformer: captures sequence-level patterns and long-range contacts
-    - The EGNN processes local geometry, Evoformer processes global context
-    """
-
     def __init__(
         self,
-        node_input_dim: int = 1304,   # ESM2(1280) + one-hot(20) + biochem(4)
-        edge_input_dim: int = 4,       # weight, type, contact, coulomb
-        hidden_dim: int = 256,         # H
-        num_egnn_layers: int = 3,      # Number of equivariant layers
-        num_evoformer_blocks: int = 4, # Number of attention blocks
-        num_heads: int = 8,            # Attention heads
+        node_input_dim: int = 1305,
+        edge_input_dim: int = 4,
+        hidden_dim: int = 256,
+        num_egnn_layers: int = 3,
+        num_evoformer_blocks: int = 4,
+        num_heads: int = 8,
         dropout: float = 0.1,
-        update_coords: bool = True,    # Whether to update 3D positions
+        update_coords: bool = True,
+        num_recycles: int = 3,  # R — how many Evoformer refinement passes
+        alpha: float = 0.3,          
     ):
         super().__init__()
 
         self.hidden_dim = hidden_dim
+        self.num_recycles = num_recycles
+        self.alpha = nn.Parameter(torch.tensor(alpha))  # learnable recycling weight
 
-        # --- Feature Projections ---
+        # --- Projections ---
         self.node_proj = FeatureProjection(node_input_dim, hidden_dim, dropout)
         self.edge_proj = FeatureProjection(edge_input_dim, hidden_dim, dropout)
-        
 
-        # --- EGNN Layers (Equivariant) ---
         self.egnn_layers = nn.ModuleList([
             EGNNLayer(
                 hidden_dim=hidden_dim,
-                edge_dim=hidden_dim,  # After projection
+                edge_dim=hidden_dim,
                 update_coords=update_coords,
-                dropout=dropout
+                dropout=dropout,
             )
             for _ in range(num_egnn_layers)
         ])
+        self.egnn_edge_updates = nn.ModuleList([
+            EdgeUpdateLayer(hidden_dim, dropout)
+            for _ in range(num_egnn_layers)
+        ])
 
-        # --- Evoformer Blocks (Attention) ---
+        # --- Evoformer (runs R times — attention refinement) ---
         self.evoformer_blocks = nn.ModuleList([
             EvoformerBlock(
                 hidden_dim=hidden_dim,
                 num_heads=num_heads,
                 ffn_dim=hidden_dim * 4,
                 dropout=dropout,
-                use_edge_bias=True
+                use_edge_bias=True,
             )
             for _ in range(num_evoformer_blocks)
         ])
+        self.evoformer_edge_updates = nn.ModuleList([
+            EdgeUpdateLayer(hidden_dim, dropout)
+            for _ in range(num_evoformer_blocks)
+        ])
 
-        # --- Output Head ---
+        # --- Recycling signal projection ---
+        self.recycle_proj = nn.Sequential(
+        nn.Linear(hidden_dim, hidden_dim),
+        nn.LayerNorm(hidden_dim),
+        )
+
+        # --- Output head ---
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.output_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim // 2, 1),  # Single output per residue
+            nn.Linear(hidden_dim // 2, 1),
         )
 
-    def forward(self, data) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Stage 1 — geometry encoding (called once per forward)
+    # ------------------------------------------------------------------
+
+    def _encode_geometry(self, h, pos, edge_index, edge_h):
         """
-        Forward pass.
-
-        Args:
-            data: PyTorch Geometric Data object with:
-                - x: (N, 1304) node features
-                - pos: (N, 3) Cb coordinates
-                - edge_index: (2, E) edges
-                - edge_attr: (E, 4) edge features
-
-        Returns:
-            (N,) binding probability per residue
+        Runs EGNN layers once. Returns updated h, pos, edge_h.
+        These are fixed for all recycling passes — geometry doesn't change.
         """
-        # Unpack data (like accessing dict in TensorFlow)
-        h = data.x              # (N, 1304)
-        pos = data.pos          # (N, 3)
-        edge_index = data.edge_index  # (2, E)
-        edge_attr = data.edge_attr    # (E, 4)
-
-        # --- Project to hidden dimension ---
-        h = self.node_proj(h)           # (N, H)
-        edge_h = self.edge_proj(edge_attr)  # (E, H)
-
-        # --- EGNN Layers ---
-        # These update both node features AND coordinates
-        for egnn in self.egnn_layers:
+        for egnn, edge_upd in zip(self.egnn_layers, self.egnn_edge_updates):
             h, pos = egnn(h, pos, edge_index, edge_h)
+            edge_h = edge_upd(edge_h, h, edge_index)
+        return h, pos, edge_h
 
-        # --- Evoformer Blocks ---
-        # These only update node features (attention-based)
-        for evoformer in self.evoformer_blocks:
-            h = evoformer(h, edge_index, edge_h)
+    # ------------------------------------------------------------------
+    # Stage 2 — attention refinement (called R times per forward)
+    # ------------------------------------------------------------------
 
-        # --- Output ---
-        h = self.final_norm(h)
-        logits = self.output_head(h).squeeze(-1)  # (N,)
+    def _refine_attention(
+        self,
+        h: torch.Tensor,           # (N, H) geometry-encoded features
+        edge_index: torch.Tensor,
+        edge_h: torch.Tensor,
+        prev_h: torch.Tensor,      # (N, H) full h from previous pass — not logits
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Refines attention using recycled signals.
+        prev_h carries the full attention context from the previous pass.
+        recycle_proj learns how much of the previous state to mix in —
+        it acts as a learned gate, not just a linear rescaling.
+        """
+        recycle_signal = self.recycle_proj(prev_h)  # (N, H) → (N, H)
+        alpha = torch.sigmoid(self.alpha)  # ensure alpha is between 0 and 1
+        h = h + alpha * recycle_signal                       # residual injection
 
-        # Sigmoid for probability (use BCEWithLogitsLoss for training)
-        # During training, return logits; for inference, apply sigmoid
+        for evo, edge_upd in zip(self.evoformer_blocks, self.evoformer_edge_updates):
+            h = evo(h, edge_index, edge_h)
+            edge_h = edge_upd(edge_h, h, edge_index)
+
+        logits = self.output_head(self.final_norm(h)).squeeze(-1)  # (N,)
+        return h, edge_h, logits   # return h — this is what gets recycled
+
+    # ------------------------------------------------------------------
+    # Forward — wires both stages with recycling loop
+    # ------------------------------------------------------------------
+
+    def forward(self, data) -> torch.Tensor:
+        h          = data.x
+        pos        = data.pos
+        edge_index = data.edge_index
+        edge_h     = self.edge_proj(data.edge_attr)
+        h          = self.node_proj(h)
+
+        # Stage 1 — geometry, runs once
+        h_geom, pos, edge_h_geom = self._encode_geometry(
+            h, pos, edge_index, edge_h
+        )
+
+        # Stage 2 — recycling loop
+        prev_h  = torch.zeros_like(h_geom)
+        edge_in = edge_h_geom
+
+        for recycle_idx in range(self.num_recycles):
+            last_pass = (recycle_idx == self.num_recycles - 1)
+
+            # Pass 0: start from geometry encoding
+            # Pass 1+: continue evolving from previous refined state
+            if recycle_idx == 0:
+                h_in = h_geom if last_pass else h_geom.detach()
+            else:
+                h_in = prev_h if last_pass else prev_h.detach()
+
+            prev_in  = prev_h  if last_pass else prev_h.detach()
+            edge_in_ = edge_in if last_pass else edge_in.detach()
+
+            h_refined, edge_refined, logits = self._refine_attention(
+                h_in, edge_index, edge_in_, prev_in
+            )
+
+            prev_h  = h_refined
+            edge_in = edge_refined
+
         return logits
 
     def predict(self, data) -> torch.Tensor:
-        """Inference mode: returns probabilities."""
-        logits = self.forward(data)
-        return torch.sigmoid(logits)
+        """Inference — returns probabilities, no gradient needed."""
+        with torch.no_grad():
+            return torch.sigmoid(self.forward(data))
+
+
+
