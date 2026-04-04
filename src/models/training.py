@@ -1,15 +1,25 @@
 import torch
 import numpy as np
 import wandb
-from src.models.loss import FocalLoss
-from src.loggers.metrics import compute_metrics
-from src.visualize.graph_utils import (
-    create_wandb_comparison_table,
-    add_to_wandb_comparison_table,
-)
 import os
 from dotenv import load_dotenv
 from typing import Optional
+
+# Handle both relative and absolute imports
+try:
+    from .loss import FocalLoss
+    from .metrics import compute_metrics
+    from ..visualize.graph_utils import (
+        create_wandb_comparison_table,
+        add_to_wandb_comparison_table,
+    )
+except ImportError:
+    from src.models.loss import FocalLoss
+    from src.models.metrics import compute_metrics
+    from src.visualize.graph_utils import (
+        create_wandb_comparison_table,
+        add_to_wandb_comparison_table,
+    )
 
 load_dotenv()
 
